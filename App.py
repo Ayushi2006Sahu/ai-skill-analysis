@@ -1,43 +1,69 @@
 import streamlit as st
 import nltk
 import spacy
-nltk.download('stopwords')
-spacy.load('en_core_web_sm')
-
+import os
+import io
+import mysql.connector
 import pandas as pd
-import base64, random
-import time, datetime
+import base64, random, time, datetime
 from pyresparser import ResumeParser
-from pdfminer3.layout import LAParams, LTTextBox
-from pdfminer3.pdfpage import PDFPage
-from pdfminer3.pdfinterp import PDFResourceManager
-from pdfminer3.pdfinterp import PDFPageInterpreter
-from pdfminer3.converter import TextConverter
-import io, random
+from pdfminer.layout import LAParams, LTTextBox
+from pdfminer.pdfpage import PDFPage
+from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+from pdfminer.converter import TextConverter
 from streamlit_tags import st_tags
 from PIL import Image
-import pymysql
 from Courses import ds_course, web_course, android_course, ios_course, uiux_course, resume_videos, interview_videos
 import pafy
+import yt_dlp
 import plotly.express as px
-import youtube_dl
+from dotenv import load_dotenv
 
+# ---- NLTK Downloads ----
+nltk.download('stopwords')
+nltk.download('punkt')
+
+# ---- Ensure SpaCy Model is Loaded ----
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    import subprocess
+    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+    nlp = spacy.load("en_core_web_sm")
+
+# ---- Load .env ----
+load_dotenv()
+
+# ---- Database Connection ----
+db = mysql.connector.connect(
+    host=os.getenv("DB_HOST"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD")
+)
+cursor = db.cursor()
+cursor.execute("CREATE DATABASE IF NOT EXISTS sra")
+db.close()
+
+db = mysql.connector.connect(
+    host=os.getenv("DB_HOST"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    database="sra"
+)
+cursor = db.cursor()
+
+# ---- Helper Functions ----
 def fetch_yt_video(link):
-    video = pafy.new(link)
-    return video.title
-
+    ydl_opts = {}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(link, download=False)
+        return info.get("title", None)
 
 def get_table_download_link(df, filename, text):
-    """Generates a link allowing the data in a given panda dataframe to be downloaded
-    in:  dataframe
-    out: href string
-    """
     csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()  # some strings <-> bytes conversions necessary here
-    # href = f'<a href="data:file/csv;base64,{b64}">Download Report</a>'
+    b64 = base64.b64encode(csv.encode()).decode()
     href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">{text}</a>'
     return href
-
 
 def pdf_reader(file):
     resource_manager = PDFResourceManager()
@@ -45,56 +71,51 @@ def pdf_reader(file):
     converter = TextConverter(resource_manager, fake_file_handle, laparams=LAParams())
     page_interpreter = PDFPageInterpreter(resource_manager, converter)
     with open(file, 'rb') as fh:
-        for page in PDFPage.get_pages(fh,
-                                      caching=True,
-                                      check_extractable=True):
+        for page in PDFPage.get_pages(fh, caching=True, check_extractable=True):
             page_interpreter.process_page(page)
-            print(page)
-        text = fake_file_handle.getvalue()
-
-    # close open handles
+    text = fake_file_handle.getvalue()
     converter.close()
     fake_file_handle.close()
     return text
 
-
 def show_pdf(file_path):
     with open(file_path, "rb") as f:
         base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    # pdf_display = f'<embed src="data:application/pdf;base64,{base64_pdf}" width="700" height="1000" type="application/pdf">'
-    pdf_display = F'<iframe src="data:application/pdf;base64,{base64_pdf}" width="700" height="1000" type="application/pdf"></iframe>'
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="700" height="1000"></iframe>'
     st.markdown(pdf_display, unsafe_allow_html=True)
-
 
 def course_recommender(course_list):
     st.subheader("**Courses & Certificates🎓 Recommendations**")
-    c = 0
-    rec_course = []
     no_of_reco = st.slider('Choose Number of Course Recommendations:', 1, 10, 4)
     random.shuffle(course_list)
-    for c_name, c_link in course_list:
-        c += 1
+    rec_course = []
+    for c, (c_name, c_link) in enumerate(course_list, 1):
         st.markdown(f"({c}) [{c_name}]({c_link})")
         rec_course.append(c_name)
         if c == no_of_reco:
             break
     return rec_course
 
-
-connection = pymysql.connect(host='localhost', user='root', password='')
-cursor = connection.cursor()
-
-
-def insert_data(name, email, res_score, timestamp, no_of_pages, reco_field, cand_level, skills, recommended_skills,
-                courses):
+def insert_data(name, email, res_score, timestamp, no_of_pages, reco_field, cand_level, skills, recommended_skills, courses):
     DB_table_name = 'user_data'
-    insert_sql = "insert into " + DB_table_name + """
-    values (0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
-    rec_values = (
-    name, email, str(res_score), timestamp, str(no_of_pages), reco_field, cand_level, skills, recommended_skills,
-    courses)
+
+    # --- Fix for column length ---
+    if isinstance(skills, str) and len(skills) > 255:   # agar column VARCHAR(255) hai
+        skills = skills[:255]
+
+    if isinstance(recommended_skills, str) and len(recommended_skills) > 255:
+        recommended_skills = recommended_skills[:255]
+
+    if isinstance(courses, str) and len(courses) > 255:
+        courses = courses[:255]
+    # -----------------------------
+
+    insert_sql = f"INSERT INTO {DB_table_name} VALUES (0,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+    rec_values = (name, email, str(res_score), timestamp, str(no_of_pages), reco_field, cand_level, skills, recommended_skills, courses)
     cursor.execute(insert_sql, rec_values)
-    connection.commit()
+    db.commit()
+
+
 
 
 st.set_page_config(
@@ -114,10 +135,6 @@ def run():
     img = img.resize((250, 250))
     st.image(img)
 
-    # Create the DB
-    db_sql = """CREATE DATABASE IF NOT EXISTS SRA;"""
-    cursor.execute(db_sql)
-    connection.select_db("sra")
 
     # Create table
     DB_table_name = 'user_data'
@@ -385,7 +402,7 @@ def run():
                 st.subheader("✅ **" + int_vid_title + "**")
                 st.video(interview_vid)
 
-                connection.commit()
+
             else:
                 st.error('Something went wrong..')
     else:
